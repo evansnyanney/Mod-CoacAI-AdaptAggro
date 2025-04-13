@@ -14,16 +14,29 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 /**
- * Modified CoacAI with aggression parameter.
- * @author 
- * (Based on https://github.com/Coac with modifications)
+ * MyValorAI
+ * 
+ * This AI is based on CoacAI with modifications incorporating an aggression parameter as well as
+ * a simplified Nash Equilibrium decision mechanism.
+ * 
+ * - aggressionLevel: 0.0 means very cautious; 1.0 means very aggressive. (Default: 0.5)
+ * - nashEquilibriumFactor: adjusts the sensitivity of the equilibrium decision. (Default: 1.0)
+ * 
+ * The Nash equilibrium decision is computed by comparing the aggregated "combat cost" scores of 
+ * our units versus the enemy’s. These scores are weighted by both the aggressionLevel and the Nash 
+ * equilibrium factor. This serves as a simplified game-theoretic decision rule for determining 
+ * whether to attack using combat units.
  */
 public class MyValorAI extends AbstractionLayerAIWait1 {
     
-    // Aggression parameter: 0.0 = very cautious, 1.0 = very aggressive (with default 0.5)
+    // Aggression parameter: 0.0 = very cautious, 1.0 = very aggressive (default: 0.5)
     private double aggressionLevel = 0.5;
     
-    public void setAggressionLevel(double level) {
+    // Nash Equilibrium Factor: adjusts the sensitivity of the equilibrium decision (default: 1.0)
+    private double nashEquilibriumFactor = 1.0;
+    
+    // Getters and setters
+    public void setAggressionLevel(double level) {   
         aggressionLevel = level;
     }
     
@@ -31,6 +44,15 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
         return aggressionLevel;
     }
     
+    public void setNashEquilibriumFactor(double factor) { 
+        nashEquilibriumFactor = factor;
+    }
+    
+    public double getNashEquilibriumFactor() {
+        return nashEquilibriumFactor;
+    }
+
+    // Existing fields in the AI
     protected UnitTypeTable utt;
     UnitType workerType;
     UnitType baseType;
@@ -88,6 +110,7 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
         reset(a_utt);
     }
 
+    @Override
     public void reset() {
         super.reset();
     }
@@ -106,7 +129,120 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
     public AI clone() {
         return new MyValorAI(utt, astar);
     }
-
+    
+    // ----------------------------------------------------------------------
+    // Nash Equilibrium Decision Logic
+    // ----------------------------------------------------------------------
+    
+    /**
+     * Computes a decision based on a simplified Nash equilibrium idea.
+     * In this heuristic, we aggregate the combat "cost" scores for our units and the enemy.
+     * Then, we weight the difference using both the aggressionLevel and nashEquilibriumFactor.
+     * 
+     * @return true if the computed advantage suggests attacking, false otherwise.
+     */
+    private boolean computeNashEquilibriumDecision() {
+        // Sum of enemy combat units cost
+        int enemyCombatScore = enemyCombatUnits.stream().mapToInt(Unit::getCost).sum();
+        // Sum our own combat units cost (free and busy)
+        int myCombatScore = myCombatUnits.stream().mapToInt(Unit::getCost).sum()
+                            + myCombatUnitsBusy.stream().mapToInt(Unit::getCost).sum();
+        // Calculate our advantage – if positive, we are stronger
+        int advantage = myCombatScore - enemyCombatScore;
+        
+        // A threshold scaled by nashEquilibriumFactor and (1.0 - aggressionLevel)
+        // (The constant 10 is a scaling factor; adjust as needed)
+        double threshold = nashEquilibriumFactor * (1.0 - aggressionLevel) * 10;
+        
+        return advantage > threshold;
+        
+        // Alternative: using a logistic function
+        // double probability = 1.0 / (1.0 + Math.exp(-((double)advantage) / threshold));
+        // return probability > 0.5;
+    }
+    
+    // ----------------------------------------------------------------------
+    // Additional Methods Added to Resolve Missing Definitions
+    // ----------------------------------------------------------------------
+    
+    /**
+     * Checks if the base is separated from enemies using a simple flood fill.
+     * For larger maps (width >= 10), the method returns false to avoid heavy computation.
+     */
+    private boolean isBaseSeparated(Unit base) {
+        if (pgs.getWidth() >= 10) {
+            return false;
+        }
+        List<Position> stack = new LinkedList<>();
+        List<Position> visited = new LinkedList<>();
+        stack.add(new Position(base.getX(), base.getY()));
+        while (!stack.isEmpty()) {
+            Position pos = stack.remove(0);
+            Unit unit = pgs.getUnitAt(pos.getX(), pos.getY());
+            if (unit != null && isEnemyUnit(unit)) {
+                return false;
+            }
+            List<Position> validAdjacentPos = pos.adjacentPos().stream()
+                    .filter(this::isValidPos)
+                    .filter(p -> !visited.contains(p))
+                    .filter(p -> !stack.contains(p))
+                    .filter(p -> {
+                        if (pgs.getTerrain(p.getX(), p.getY()) == PhysicalGameState.TERRAIN_WALL) {
+                            return false;
+                        }
+                        Unit unitAtPos = pgs.getUnitAt(p.getX(), p.getY());
+                        return unitAtPos == null || !unitAtPos.getType().isResource;
+                    })
+                    .collect(Collectors.toList());
+            stack.addAll(validAdjacentPos);
+            visited.add(pos);
+        }
+        wasSeparated = true;
+        return true;
+    }
+    
+    /**
+     * Computes barracks action for the 16x16 map.
+     */
+    private void computeBarracksActionBasesWorkers16x16A() {
+        long heavyCount = myCombatUnits.stream().filter(u -> u.getType() == heavyType).count() 
+                            + myCombatUnitsBusy.stream().filter(u -> u.getType() == heavyType).count();
+        for (Unit barrack : myBarracks) {
+            if (heavyCount > 0) {
+                train(barrack, rangedType);
+            } else {
+                if (wasSeparated) {
+                    train(barrack, rangedType);
+                } else {
+                    train(barrack, heavyType);
+                }
+            }
+        }
+    }
+    
+    /**
+     * Computes the standard barracks action.
+     */
+    private void computeBarracksAction() {
+        long heavyCount = myCombatUnits.stream().filter(u -> u.getType() == heavyType).count() 
+                            + myCombatUnitsBusy.stream().filter(u -> u.getType() == heavyType).count();
+        for (Unit barrack : myBarracks) {
+            if (heavyCount > 3) {
+                train(barrack, rangedType);
+            } else {
+                if (wasSeparated) {
+                    train(barrack, rangedType);
+                } else {
+                    train(barrack, heavyType);
+                }
+            }
+        }
+    }
+    
+    // ----------------------------------------------------------------------
+    // Main Initialization and Game Update Methods
+    // ----------------------------------------------------------------------
+    
     private void init() {
         if (pgs.getWidth() <= 8) {
             defenseBaseDistance = 2;
@@ -203,50 +339,45 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
         baseDefensePositions = new HashMap<>();
         baseDefensePositionsRanged = new HashMap<>();
 
-        // Defense position specific to each base
+        // Set up defense positions for each base
         for (Unit base : myBases) {
             baseDefensePositions.put(base.getID(), getDefensePositions(base, defenseBaseDistance));
             baseDefensePositionsRanged.put(base.getID(), getDefensePositions(base, defenseBaseDistance - 1));
         }
 
-        // Damages
+        // Damages tracking for units already attacking
         damages = new HashMap<>();
-        List<Unit> myUnitsBusy = new LinkedList<>();
-        myUnitsBusy.addAll(myCombatUnitsBusy);
-        myUnitsBusy.addAll(myWorkersBusy);
-        for (Unit unit : myUnitsBusy) {
+        List<Unit> myUnitsBusyList = new LinkedList<>();
+        myUnitsBusyList.addAll(myCombatUnitsBusy);
+        myUnitsBusyList.addAll(myWorkersBusy);
+        for (Unit unit : myUnitsBusyList) {
             UnitAction action = gs.getUnitAction(unit);
             printDebug(unit + " is doing " + action);
-
             if (action == null || action.getType() != UnitAction.TYPE_ATTACK_LOCATION) {
                 continue;
             }
-
             Unit enemy = pgs.getUnitAt(action.getLocationX(), action.getLocationY());
             if (enemy == null) {
                 if (debug) {
-                    throw new RuntimeException("Problem: we attack only sure hit enemy but " + unit + " attacking empty cell " + action);
+                    throw new RuntimeException("Problem: " + unit + " attacking empty cell " + action);
                 }
                 continue;
             }
-
             registerAttackDamage(unit, enemy);
         }
 
-        // Harvesting
+        // Update harvesting assignments
         List<Long> toBeRemoved = new ArrayList<>();
         List<Unit> myWorkersBusyAndFree = new LinkedList<>();
         myWorkersBusyAndFree.addAll(myWorkers);
         myWorkersBusyAndFree.addAll(myWorkersBusy);
         for (Map.Entry<Long, Long> entry : harvesting.entrySet()) {
             long harvesterID = entry.getKey();
-            // Check if worker is dead
             Optional<Unit> worker = myWorkersBusyAndFree.stream().filter(u -> u.getID() == harvesterID).findAny();
             if (!worker.isPresent()) {
                 toBeRemoved.add(harvesterID);
                 continue;
             }
-
             long baseID = entry.getValue();
             Optional<Unit> base = myBases.stream().filter(u -> u.getID() == baseID).findAny();
             if (!base.isPresent()) {
@@ -258,7 +389,7 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
         }
 
         constructingBarracksForBase = new HashMap<>();
-        // Constructing barracks
+        // Check if a barracks is being constructed for a base
         for (Unit worker : myWorkersBusy) {
             UnitAction action = gs.getUnitAction(worker);
             if (action.getType() == UnitAction.TYPE_PRODUCE && action.getUnitType() == barracksType) {
@@ -269,7 +400,7 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
             }
         }
 
-        // Base separated
+        // Determine if bases are separated from enemies
         baseSeparated = new HashMap<>();
         for (Unit base : myBases) {
             baseSeparated.put(base.getID(), isBaseSeparated(base));
@@ -283,29 +414,29 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
                 if (distanceChebyshev(base, x, y) != defenseBaseDistance) {
                     continue;
                 }
-
                 if (isThereResourceAdjacent(x, y, 1)) {
-                    // Prevent another unit to block resource
                     continue;
                 }
-
                 int pos = pgsPos(x, y);
                 defensePositions.add(pos);
             }
         }
         return defensePositions;
     }
-
+    
+    // ----------------------------------------------------------------------
+    // Main getAction
+    // ----------------------------------------------------------------------
+    
     @Override
     public PlayerAction getAction(int player, GameState gs) {
         long start_time = System.currentTimeMillis();
-
         this.gs = gs;
         this.pgs = gs.getPhysicalGameState();
         p = gs.getPlayer(player);
         enemyPlayer = gs.getPlayer(player == 0 ? 1 : 0);
 
-        if (myWorkersCombat == null) { // Just started
+        if (myWorkersCombat == null) { // On first call
             int hash = this.pgs.toString().hashCode();
             printDebug("Map hash: " + hash);
             if (hash == 1835166811) {
@@ -321,15 +452,17 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
             attackAll = true;
             attackWithCombat = true;
         }
-        // Modified combat decision logic incorporating aggressionLevel:
+        
+        // Use the Nash equilibrium decision to determine whether to attack with combat units
+        attackWithCombat = computeNashEquilibriumDecision();
         int enemyCombatScore = enemyCombatUnits.stream().mapToInt(Unit::getCost).sum();
-        int myCombatScore = myCombatUnits.stream().mapToInt(Unit::getCost).sum() 
-                            + myCombatUnitsBusy.stream().mapToInt(Unit::getCost).sum();
-        if (myCombatScore - 4 > enemyCombatScore * (1.0 - aggressionLevel)) {
-            attackWithCombat = true;
-        } else {
-            attackWithCombat = false;
-        }
+        int myCombatScore = myCombatUnits.stream().mapToInt(Unit::getCost).sum() +
+                            myCombatUnitsBusy.stream().mapToInt(Unit::getCost).sum();
+        printDebug("Combat scores: myCombatScore=" + myCombatScore +
+                   ", enemyCombatScore=" + enemyCombatScore +
+                   ", aggressionLevel=" + aggressionLevel +
+                   ", Nash Factor=" + nashEquilibriumFactor +
+                   ", decision (attackWithCombat)=" + attackWithCombat);
 
         this.computeWorkersAction();
         if (this.map.equals("maps/16x16/basesWorkers16x16A.xml")) {
@@ -352,87 +485,11 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
         printDebug("actions: " + pa);
         return pa;
     }
-
-    // Flood fill to check if the base is separated from enemies
-    private boolean isBaseSeparated(Unit base) {
-        if (pgs.getWidth() >= 10) {
-            // Map too big to flood fill
-            return false;
-        }
-        List<Position> stack = new LinkedList<>();
-        List<Position> visited = new LinkedList<>();
-
-        stack.add(new Position(base.getX(), base.getY()));
-        int visitedPos = 0;
-
-        while (!stack.isEmpty()) {
-            visitedPos++;
-
-            Position pos = stack.remove(0);
-
-            Unit unit = pgs.getUnitAt(pos.getX(), pos.getY());
-            if (unit != null && isEnemyUnit(unit)) {
-                return false;
-            }
-
-            List<Position> validAdjacentPos = pos.adjacentPos().stream()
-                    .filter(this::isValidPos)
-                    .filter(p -> !visited.contains(p))
-                    .filter(p -> !stack.contains(p))
-                    .filter(p -> {
-                        if (pgs.getTerrain(pos.getX(), pos.getY()) == PhysicalGameState.TERRAIN_WALL) {
-                            return false;
-                        }
-                        Unit unitAtPos = pgs.getUnitAt(pos.getX(), pos.getY());
-                        if (unitAtPos == null) {
-                            return true;
-                        }
-                        return !unitAtPos.getType().isResource;
-                    }).collect(Collectors.toList());
-
-            stack.addAll(validAdjacentPos);
-            visited.add(pos);
-        }
-
-        printDebug("visited " + visitedPos);
-
-        wasSeparated = true;
-        return true;
-    }
-
-    private void computeBarracksAction() {
-        long heavyCount = myCombatUnits.stream().filter(u -> u.getType() == heavyType).count() 
-                        + myCombatUnitsBusy.stream().filter(u -> u.getType() == heavyType).count();
-        for (Unit barrack : myBarracks) {
-            if (heavyCount > 3) {
-                train(barrack, rangedType);
-            } else {
-                if (wasSeparated) {
-                    train(barrack, rangedType);
-                } else {
-                    train(barrack, heavyType);
-                }
-            }
-        }
-    }
-
-    private void computeBarracksActionBasesWorkers16x16A() {
-        long heavyCount = myCombatUnits.stream().filter(u -> u.getType() == heavyType).count() 
-                        + myCombatUnitsBusy.stream().filter(u -> u.getType() == heavyType).count();
-        for (Unit barrack : myBarracks) {
-            if (heavyCount > 0) {
-                train(barrack, rangedType);
-            } else {
-                if (wasSeparated) {
-                    train(barrack, rangedType);
-                } else {
-                    train(barrack, heavyType);
-                }
-            }
-        }
-    }
-
-    // Attack only sure hit enemies
+    
+    // ----------------------------------------------------------------------
+    // Combat Actions and Helpers
+    // ----------------------------------------------------------------------
+    
     private void computeCombatAction(Unit unit) {
         List<Unit> aliveEnemies = this.aliveEnemies;
         if (aliveEnemies.isEmpty()) {
@@ -441,31 +498,32 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
             return;
         }
 
-        List<Unit> enemiesInRange = aliveEnemies.stream().filter(e -> enemyIsInRangeAttack(unit, e)).collect(Collectors.toList());
-        List<Unit> attackableEnemies = enemiesInRange.stream().filter(e -> !willBeMoveBeforeAttack(unit, e)).collect(Collectors.toList());
+        List<Unit> enemiesInRange = aliveEnemies.stream()
+                .filter(e -> enemyIsInRangeAttack(unit, e))
+                .collect(Collectors.toList());
+        List<Unit> attackableEnemies = enemiesInRange.stream()
+                .filter(e -> !willBeMoveBeforeAttack(unit, e))
+                .collect(Collectors.toList());
 
-        // Attack enemies in range that will not be moving
         if (!attackableEnemies.isEmpty()) {
             Unit closestEnemy = bestToAttack(unit, attackableEnemies);
-            printDebug(unit + " attacking " + closestEnemy + " damageBeforeAttack:" + damages.getOrDefault(closestEnemy.getID(), 0)
-                    + " enemyAction:" + gs.getActionAssignment(closestEnemy));
+            printDebug(unit + " attacking " + closestEnemy + " damageBeforeAttack:" +
+                       damages.getOrDefault(closestEnemy.getID(), 0) +
+                       " enemyAction:" + gs.getActionAssignment(closestEnemy));
             attackAndRegisterDamage(unit, closestEnemy);
             return;
         }
 
-        // There are moving enemies
         if (!enemiesInRange.isEmpty()) {
             if (unit.getAttackRange() > 1) {
                 Unit movingEnemy = closestUnitAfterMoveAction(unit, enemiesInRange);
-
-                // Next enemy position he still can't attack
                 if (squareDist(unit, nextPos(movingEnemy, gs)) > movingEnemy.getAttackRange()) {
                     printDebug("ranged flee safe");
                     moveAwayFrom(unit, movingEnemy);
                     return;
                 } else {
-                    // Next position he can attack
-                    if (gs.getActionAssignment(movingEnemy).time - gs.getTime() + movingEnemy.getAttackTime() >= unit.getMoveTime()) {
+                    if (gs.getActionAssignment(movingEnemy).time - gs.getTime() +
+                        movingEnemy.getAttackTime() >= unit.getMoveTime()) {
                         printDebug("ranged flee adjacent");
                         moveAwayFrom(unit, movingEnemy);
                     }
@@ -484,22 +542,22 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
             return;
         }
 
-        List<Unit> myUnits = new ArrayList<>();
-        myUnits.addAll(myCombatUnits);
-        myUnits.addAll(myCombatUnitsBusy);
-        myUnits.addAll(myWorkersCombat);
-        if (myUnits.isEmpty()) {
+        List<Unit> myUnitsList = new ArrayList<>();
+        myUnitsList.addAll(myCombatUnits);
+        myUnitsList.addAll(myCombatUnitsBusy);
+        myUnitsList.addAll(myWorkersCombat);
+        if (myUnitsList.isEmpty()) {
             if (gs.getTime() > MAXCYCLES / 2) {
                 printDebug(unit + " chasing " + closestEnemy);
                 chaseToAttack(unit, closestEnemy);
                 return;
             }
-            printDebug(unit + " waiting for more unit ");
+            printDebug(unit + " waiting for more unit");
             actions.put(unit, new TrueIdle(unit));
             return;
         }
 
-        Position centroid = centroid(myUnits);
+        Position centroid = centroid(myUnitsList);
         if (gs.getTime() > MAXCYCLES / 2 || distance(unit, centroid) <= 3) {
             printDebug(unit + " chasing " + closestEnemy);
             chaseToAttack(unit, closestEnemy);
@@ -508,7 +566,7 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
             move(unit, centroid.getX(), centroid.getY());
         }
     }
-
+    
     private void moveAwayFrom(Unit unit, Unit movingEnemy) {
         Position enemyPos = nextPos(movingEnemy, gs);
         int currentDist = distance(unit, enemyPos);
@@ -545,46 +603,44 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
                 newPos = posLeft;
             }
         }
-
         printDebug(unit + " fleeing away from " + movingEnemy + " going to " + newPos);
         move(unit, newPos.x, newPos.y);
     }
-
+    
     private int sumDistanceFromEnemy(Position pos) {
         return aliveEnemies.stream().mapToInt(e -> distance(pos, nextPos(e, gs))).sum();
     }
-
+    
     private void computeCombatUnitsAction() {
         for (Unit unit : myCombatUnits) {
             computeCombatAction(unit);
         }
     }
-
+    
     private void computeBasesAction() {
         for (Unit base : myBases) {
             if (baseSeparated.getOrDefault(base.getID(), false)) {
                 continue;
             }
-
-            if (pgs.getWidth() <= 8) { // Always train worker on small map
+            if (pgs.getWidth() <= 8) {
                 train(base, workerType);
                 continue;
             }
         }
-
+        
         final int workerPerBase = 2;
         int producingWorker = 0;
         long producingCount = myBases.stream().filter(b -> gs.getActionAssignment(b) != null).count();
         for (Unit base : myBases) {
-            if (myWorkers.size() + myWorkersBusy.size() + producingWorker + producingCount >= workerPerBase * myBases.size() 
-                    && p.getResources() - resourceUsed < 15) {
+            if (myWorkers.size() + myWorkersBusy.size() + producingWorker + producingCount >= workerPerBase * myBases.size() &&
+                p.getResources() - resourceUsed < 15) {
                 return;
             }
             train(base, workerType);
             producingWorker++;
         }
     }
-
+    
     private void computeWorkersAction() {
         if (attackAll) {
             for (Unit worker : myWorkers) {
@@ -592,32 +648,26 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
             }
             return;
         }
-
         // Build barracks if needed
         buildBarracks();
-
-        // Harvest
+        
+        // Harvesting behavior
         if (!myWorkers.isEmpty() && !myBases.isEmpty() && !resources.isEmpty()) {
             for (int i = 0; i < myBases.size(); i++) {
                 Optional<Unit> optionalUnit = myWorkers.stream().filter(w -> !harvesting.containsKey(w.getID()))
                         .min(Comparator.comparingInt(this::harvestScore));
-
-                Unit harvesterWorker = null;
-                if (optionalUnit.isPresent()) {
-                    harvesterWorker = optionalUnit.get();
-                }
+                Unit harvesterWorker = optionalUnit.orElse(null);
                 if (harvesterWorker == null || harvestScore(harvesterWorker) == Integer.MAX_VALUE) {
                     break;
                 }
                 harvestClosest(harvesterWorker);
             }
         }
-
-        // Use remaining workers for defense/attack
+        
+        // If not harvesting, assign workers to combat/defense
         for (Unit worker : myWorkers) {
             boolean isHarvester = harvesting.containsKey(worker.getID());
             Unit closestEnemy = closestUnit(worker, this.aliveEnemies);
-
             if (isHarvester) {
                 if (closestEnemy != null && distance(closestEnemy, worker) <= 2) {
                     harvesting.remove(worker.getID());
@@ -632,21 +682,18 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
                 actions.put(worker, new HarvestReturn(worker, closestResource, assignedBase, pf));
                 continue;
             }
-
             myWorkersCombat.add(worker);
             computeCombatAction(worker);
         }
     }
-
+    
     private void buildBarracks() {
         if (myBarracks.size() == 0 && p.getResources() - resourceUsed >= barracksType.cost + 1) {
             for (Unit base : myBases) {
                 if (constructingBarracksForBase.containsKey(base.getID())) {
                     continue;
                 }
-
                 boolean safeDistanceToBuild = true;
-
                 if (!baseSeparated.getOrDefault(base.getID(), false)) {
                     Unit enemy = closestUnit(base, this.aliveEnemies);
                     if (enemy != null) {
@@ -656,47 +703,37 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
                         safeDistanceToBuild = true;
                     }
                 }
-
                 if (!safeDistanceToBuild) {
                     continue;
                 }
-
                 Unit closestWorker = closestUnit(base, myWorkers);
                 if (closestWorker == null) {
                     break;
                 }
-
                 Unit enemy = closestUnit(closestWorker, this.aliveEnemies);
                 if (enemy != null && distance(closestWorker, enemy) <= 2) {
                     continue;
                 }
-
                 if (distance(closestWorker, base) > 2) {
                     continue;
                 }
-
                 Position workerPos = new Position(closestWorker.getX(), closestWorker.getY());
                 List<Position> adjacentPos = workerPos.adjacentPos();
-
                 Position bestPos = null;
                 int closestDist = wasSeparated ? 9999999 : 0;
                 for (Position pos : adjacentPos) {
                     if (!isValidPos(pos)) {
                         continue;
                     }
-
                     if (isThereResourceAdjacent(pos.getX(), pos.getY(), 1)) {
                         continue;
                     }
-
                     if (pgs.getUnitAt(pos.x, pos.y) != null) {
                         continue;
                     }
-
                     if (enemy == null) {
                         break;
                     }
-
                     int dist = distance(enemy, pos);
                     if ((wasSeparated && dist < closestDist) || (!wasSeparated && dist > closestDist)) {
                         bestPos = pos;
@@ -706,70 +743,67 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
                 if (bestPos == null) {
                     continue;
                 }
-
                 actions.put(closestWorker, new BuildModified(closestWorker, barracksType, bestPos.x, bestPos.y, pf));
                 printDebug(closestWorker + " BUILDING at " + bestPos);
-
                 myWorkers.remove(closestWorker);
                 myWorkersBusy.add(closestWorker);
                 resourceUsed += barracksType.cost;
             }
         }
     }
-
+    
     private void printDebug(String string) {
         if (!debug) {
             return;
         }
         System.out.println(string);
     }
-
+    
     private boolean isThereResourceAdjacent(int x, int y, int distance) {
         Collection<Unit> unitsAround = pgs.getUnitsAround(x, y, distance, distance);
         Optional<Unit> resource = unitsAround.stream().filter(unit -> unit.getType().isResource).findAny();
         return resource.isPresent();
     }
-
+    
     private boolean isThereBaseAdjacent(int x, int y, int distance) {
         Collection<Unit> unitsAround = pgs.getUnitsAround(x, y, distance, distance);
         Optional<Unit> resource = unitsAround.stream().filter(unit -> unit.getType().isStockpile).findAny();
         return resource.isPresent();
     }
-
+    
     private void chaseToAttack(Unit worker, Unit closestEnemy) {
         attackAndRegisterDamage(worker, closestEnemy);
     }
-
+    
     private void attackAndRegisterDamage(Unit worker, Unit closestEnemy) {
         if (enemyIsInRangeAttack(worker, closestEnemy)) {
             registerAttackDamage(worker, closestEnemy);
         }
         actions.put(worker, new CoacAttack(worker, closestEnemy, pf));
     }
-
+    
     private void registerAttackDamage(Unit worker, Unit closestEnemy) {
         int damage = (worker.getMinDamage() + worker.getMaxDamage()) / 2;
         long enemyID = closestEnemy.getID();
-
         damages.put(enemyID, damage + damages.getOrDefault(enemyID, 0));
         if (damages.get(enemyID) >= closestEnemy.getHitPoints()) {
             aliveEnemies.remove(closestEnemy);
         }
     }
-
+    
     private void defendRangedUnit(Unit unit) {
         List<Unit> myRanged = myUnits.stream().filter(u -> u.getAttackRange() > 1).collect(Collectors.toList());
         Unit closestRanged = closestUnitAfterMoveAction(unit, myRanged);
+        // Currently unused; implement behavior as needed.
     }
-
+    
     private boolean moveDefensePosition(Unit warrior) {
-        Map<Long, List<Integer>> baseDefensePositions;
+        Map<Long, List<Integer>> baseDefensePositionsLocal;
         if (warrior.getAttackRange() > 1) {
-            baseDefensePositions = this.baseDefensePositionsRanged;
+            baseDefensePositionsLocal = this.baseDefensePositionsRanged;
         } else {
-            baseDefensePositions = this.baseDefensePositions;
+            baseDefensePositionsLocal = this.baseDefensePositions;
         }
-
         Unit closestBase = closestUnit(warrior, myBases);
         if (closestBase == null) {
             return false;
@@ -778,17 +812,14 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
         if (closestEnemyFromBase == null) {
             return false;
         }
-
-        List<Integer> defensePositions = baseDefensePositions.get(closestBase.getID());
+        List<Integer> defensePositions = baseDefensePositionsLocal.get(closestBase.getID());
         int bestPos = -1;
         int minDist = Integer.MAX_VALUE;
-
         for (Integer defensePos : defensePositions) {
             Unit existingUnit = pgs.getUnitAt(pgsIntToPosX(defensePos), pgsIntToPosY(defensePos));
             if (existingUnit != null && isAllyUnit(existingUnit)) {
                 continue;
             }
-
             int dist = astar.findDistToPositionInRange(warrior, defensePos, 0, gs, gs.getResourceUsage());
             int enemyDist = distance(closestEnemyFromBase, pgsIntToPosX(defensePos), pgsIntToPosY(defensePos));
             if (dist != -1 && enemyDist < minDist) {
@@ -799,113 +830,95 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
         if (bestPos == -1) {
             return false;
         }
-
         int workerPos = warrior.getPosition(pgs);
         if (defensePositions.contains(workerPos)) {
             if (minDist <= distance(closestEnemyFromBase, pgsIntToPosX(workerPos), pgsIntToPosY(workerPos))) {
                 return false;
             }
         }
-
         move(warrior, pgsIntToPosX(bestPos), pgsIntToPosY(bestPos));
         return true;
     }
-
+    
     private int pgsPos(int x, int y) {
         return x + pgs.getWidth() * y;
     }
-
+    
     private int pgsIntToPosX(int pos) {
         return pos % pgs.getWidth();
     }
-
+    
     private Position pgsIntToPos(int pos) {
         return new Position(pgsIntToPosX(pos), pgsIntToPosY(pos));
     }
-
+    
     private int pgsIntToPosY(int pos) {
         return pos / pgs.getWidth();
     }
-
+    
     private void harvestClosest(Unit worker) {
         Unit closestResource = closestUnit(worker, myClosestResources);
         Unit closestBase = closestUnit(worker, myBases.stream().filter(base -> !baseHasEnoughHarvester(base)).collect(Collectors.toList()));
-
         printDebug(worker + " harvesting " + closestResource);
-
         harvesting.put(worker.getID(), closestBase.getID());
         harvest(worker, closestResource, closestBase);
     }
-
+    
     private int harvestScore(Unit worker) {
         Unit closestResource = closestUnit(worker, myClosestResources);
         Unit closestBase = closestUnit(worker, myBases.stream().filter(base -> !baseHasEnoughHarvester(base)).collect(Collectors.toList()));
         if (closestBase == null || closestResource == null) {
             return Integer.MAX_VALUE;
         }
-
         return distance(worker, closestBase) + distance(worker, closestResource);
     }
-
+    
     private boolean baseHasEnoughHarvester(Unit base) {
         return harvesting.values().stream().filter(b -> b == base.getID()).count() >= 2;
     }
-
-    private Unit closestUnit(Unit worker, List<Unit> enemies) {
-        Unit closestEnemy = null;
-        if (!enemies.isEmpty()) {
-            closestEnemy = enemies.stream().min(Comparator.comparing(u -> distance(worker, u))).get();
-        }
-        return closestEnemy;
+    
+    private Unit closestUnit(Unit worker, List<Unit> list) {
+        return list.stream().min(Comparator.comparing(u -> distance(worker, u))).orElse(null);
     }
-
-    // Prioritize enemy that can be killed, otherwise the closest
+    
     private Unit bestToAttack(Unit worker, List<Unit> enemies) {
-        Unit closestEnemy = null;
-        if (!enemies.isEmpty()) {
-            closestEnemy = enemies.stream().max((a, b) -> {
-                int aRemainingHP = a.getHitPoints() - damages.getOrDefault(a.getID(), 0) - worker.getMinDamage();
-                int bRemainingHP = b.getHitPoints() - damages.getOrDefault(b.getID(), 0) - worker.getMinDamage();
-                if (aRemainingHP <= 0 && bRemainingHP <= 0) {
-                    return aRemainingHP - bRemainingHP;
-                }
-                if (aRemainingHP <= 0) {
-                    return 1;
-                }
-                if (bRemainingHP <= 0) {
-                    return -1;
-                }
-                return -distance(worker, a) + distance(worker, b);
-            }).get();
-        }
-        return closestEnemy;
+        return enemies.stream().max((a, b) -> {
+            int aRemainingHP = a.getHitPoints() - damages.getOrDefault(a.getID(), 0) - worker.getMinDamage();
+            int bRemainingHP = b.getHitPoints() - damages.getOrDefault(b.getID(), 0) - worker.getMinDamage();
+            if (aRemainingHP <= 0 && bRemainingHP <= 0) {
+                return aRemainingHP - bRemainingHP;
+            }
+            if (aRemainingHP <= 0) {
+                return 1;
+            }
+            if (bRemainingHP <= 0) {
+                return -1;
+            }
+            return -distance(worker, a) + distance(worker, b);
+        }).orElse(null);
     }
-
-    // Closest unit after its move action
+    
     private Unit closestUnitAfterMoveAction(Unit worker, List<Unit> enemies) {
-        Unit closestEnemy = null;
-        if (!enemies.isEmpty()) {
-            closestEnemy = enemies.stream().min(Comparator.comparing(u -> distance(worker, nextPos(u, gs)))).get();
-        }
-        return closestEnemy;
+        return enemies.stream().min(Comparator.comparing(u -> distance(worker, nextPos(u, gs)))).orElse(null);
     }
-
+    
     private boolean isEnemyUnit(Unit u) {
         return u.getPlayer() >= 0 && u.getPlayer() != p.getID();
     }
-
+    
     private boolean isAllyUnit(Unit u) {
         return u.getPlayer() == p.getID();
     }
-
+    
     @Override
     public List<ParameterSpecification> getParameters() {
         List<ParameterSpecification> params = new ArrayList<>();
-        // Expose aggressionLevel as a parameter
+        // Expose aggressionLevel and the Nash equilibrium factor as parameters
         params.add(new ParameterSpecification("AggressionLevel", double.class, aggressionLevel));
+        params.add(new ParameterSpecification("NashEquilibriumFactor", double.class, nashEquilibriumFactor));
         return params;
     }
-
+    
     private boolean willBeMoveBeforeAttack(Unit unit, Unit closestEnemy) {
         UnitActionAssignment aa = gs.getActionAssignment(closestEnemy);
         if (aa == null) {
@@ -917,7 +930,7 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
         int eta = aa.action.ETA(closestEnemy) - (gs.getTime() - aa.time);
         return eta <= unit.getAttackTime();
     }
-
+    
     public void train(Unit u, UnitType unit_type) {
         if (gs.getActionAssignment(u) != null) {
             return;
@@ -926,23 +939,19 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
             return;
         }
         resourceUsed += unit_type.cost;
-
         List<Integer> directions = new ArrayList<>();
         directions.add(UnitAction.DIRECTION_UP);
         directions.add(UnitAction.DIRECTION_DOWN);
         directions.add(UnitAction.DIRECTION_LEFT);
         directions.add(UnitAction.DIRECTION_RIGHT);
-
-        int bestDirection = directions.stream().max(Comparator.comparingInt((d) -> scoreTrainDirection(u, d))).get();
-
+        int bestDirection = directions.stream().max(Comparator.comparingInt(d -> scoreTrainDirection(u, d))).orElse(-1);
         if (scoreTrainDirection(u, bestDirection) == Integer.MIN_VALUE) {
             printDebug(u + " failed to train");
             return;
         }
-
         actions.put(u, new TrainDirection(u, unit_type, bestDirection));
     }
-
+    
     int scoreTrainDirection(Unit u, int direction) {
         int newPosX = u.getX() + UnitAction.DIRECTION_OFFSET_X[direction];
         int newPosY = u.getY() + UnitAction.DIRECTION_OFFSET_Y[direction];
@@ -953,7 +962,11 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
         Unit enemy = closestUnit(u, enemies);
         return -distance(enemy, pos);
     }
-
+    
+    // ----------------------------------------------------------------------
+    // Inner Class for Position
+    // ----------------------------------------------------------------------
+    
     public static class Position {
         int x;
         int y;
@@ -991,7 +1004,7 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
             return Objects.hash(x, y);
         }
     }
-
+    
     public static Position nextPos(Unit target, GameState gs) {
         UnitAction targetAction = gs.getUnitAction(target);
         if (targetAction != null && targetAction.getType() == UnitAction.TYPE_MOVE) {
@@ -1003,11 +1016,11 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
         }
         return new Position(target.getX(), target.getY());
     }
-
+    
     private boolean isValidPos(Position pos) {
         return pos.x < pgs.getWidth() && pos.x >= 0 && pos.y < pgs.getHeight() && pos.y >= 0;
     }
-
+    
     private boolean isFreePos(Position pos) {
         if (pgs.getTerrain(pos.getX(), pos.getY()) == PhysicalGameState.TERRAIN_WALL) {
             return false;
@@ -1015,43 +1028,43 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
         Unit unitAtPos = pgs.getUnitAt(pos.getX(), pos.getY());
         return unitAtPos == null;
     }
-
+    
     public static boolean enemyIsInRangeAttack(Unit ourUnit, Unit closestUnit) {
         return squareDist(ourUnit, closestUnit) <= ourUnit.getAttackRange();
     }
-
+    
     static double squareDist(Unit ourUnit, Unit closestUnit) {
         int dx = closestUnit.getX() - ourUnit.getX();
         int dy = closestUnit.getY() - ourUnit.getY();
         return Math.sqrt(dx * dx + dy * dy);
     }
-
+    
     public static double squareDist(Unit ourUnit, Position pos2) {
         int dx = pos2.getX() - ourUnit.getX();
         int dy = pos2.getY() - ourUnit.getY();
         return Math.sqrt(dx * dx + dy * dy);
     }
-
+    
     int distance(Unit u1, Unit u2) {
         return Math.abs(u1.getX() - u2.getX()) + Math.abs(u1.getY() - u2.getY());
     }
-
+    
     static int distance(Unit u1, Position pos2) {
         return Math.abs(u1.getX() - pos2.getX()) + Math.abs(u1.getY() - pos2.getY());
     }
-
+    
     static int distance(Position u1, Position pos2) {
         return Math.abs(u1.getX() - pos2.getX()) + Math.abs(u1.getY() - pos2.getY());
     }
-
+    
     static int distance(Unit u1, int x, int y) {
         return Math.abs(u1.getX() - x) + Math.abs(u1.getY() - y);
     }
-
+    
     static int distanceChebyshev(Unit u1, int x2, int y2) {
         return Math.max(Math.abs(x2 - u1.getX()), Math.abs(y2 - u1.getY()));
     }
-
+    
     static Position centroid(List<Unit> units) {
         int centroidX = 0, centroidY = 0;
         for (Unit unit : units) {
@@ -1060,7 +1073,7 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
         }
         return new Position(centroidX / units.size(), centroidY / units.size());
     }
-
+    
     static int oppositeDirection(int direction) {
         if (direction == UnitAction.DIRECTION_UP) {
             return UnitAction.DIRECTION_DOWN;
@@ -1076,5 +1089,4 @@ public class MyValorAI extends AbstractionLayerAIWait1 {
         }
         throw new RuntimeException("direction not recognized");
     }
-
 }
